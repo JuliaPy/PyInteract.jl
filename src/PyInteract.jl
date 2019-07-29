@@ -17,10 +17,10 @@ module PyInteract
 using PyCall
 import IJulia, JSON
 
-const pycomm = pyimport("ipykernel.comm")
-const pykernelbase = pyimport("ipykernel.kernelbase")
+const ipykernel = pyimport("ipykernel")
+pyimport("ipykernel.ipkernel")
+pyimport("ipykernel.comm")
 const pysession = pyimport("jupyter_client.session")
-const IPython = pyimport("IPython")
 
 """
 A shim around Jupyter's Session class.
@@ -33,24 +33,46 @@ call IJulia's `send_ipython` method.
     # NOTE: We have to do this ugliness because the IPython/Jupyter codebase
     # make heavy use of both positional and keyword arguments.
     function send(
-            self, stream, msg_or_type,
-            _content=nothing, _parent=nothing, _ident=nothing,
-            _buffers=nothing, _track=false, _header=nothing,
-            _metadata=nothing;
-            content=_content, parent=_parent, ident=_ident,
-            buffers=_buffers, track=_track, header=_header,
-            metadata=_metadata,
-    )
-        IJulia.send_ipython(
+            self,
             stream,
+            msg_or_type,
+            _content=Dict(),
+            _parent=nothing,
+            _ident=nothing,
+            _buffers=nothing,
+            _track=false,
+            _header=nothing,
+            _metadata=Dict()
+            ;
+            content=_content, parent=_parent, ident=_ident, buffers=_buffers,
+            track=_track, header=_header, metadata=_metadata,
+    )
+        if buffers !== nothing && !isempty(buffers)
+            error("Unsupported use of Jupyter buffers!")
+        end
+        parent_header = pysession.extract_header(parent)
+        ident = ident === nothing ? String[] : [string(ident)]
+        msg = if isa(msg_or_type, String)
+            # msg_or_type is the type of the message.
             IJulia.Msg(
-                ident === nothing ? String[] : [string(ident)],
+                ident,
                 header === nothing ? IJulia.msg_header(IJulia.execute_msg, msg_or_type) : header,
-                content === nothing ? Dict() : content,
-                parent === nothing ? Dict() : pysession.extract_header(parent),
-                metadata === nothing ? Dict() : metadata,
-            ),
-        )
+                content,
+                parent_header,
+                metadata,
+            )
+        else
+            # msg_or_type is the message itself.
+            m = msg_or_type
+            IJulia.Msg(
+                ident,
+                get(m, "header", header),
+                get(m, "content", content),
+                get(m, "parent_header", parent_header),
+                get(m, "metadata", metadata),
+            )
+        end
+        IJulia.send_ipython(stream, msg)
     end
 end
 
@@ -83,11 +105,7 @@ There are two important methods:
         CommManager about a new comm target. This allows the kernel to create
         new comm instances when the frontend opens a comm to the kernel.
 """
-@pydef mutable struct IJuliaPyCommManager <: pycomm.CommManager
-    function __init__(self, kernel)
-        self.kernel = kernel
-    end
-
+@pydef mutable struct IJuliaPyCommManager <: ipykernel.comm.CommManager
     function register_comm(self, comm)
         comm.kernel = self.kernel
         jlcomm = IJulia.CommManager.Comm(
@@ -103,8 +121,42 @@ There are two important methods:
     # just trying to get ipywidgets to work (which only opens comms from the
     # kernel to the frontend). This could be implemented in the future.
     function register_target(self, target, f)
-        @warn "Zounds! unsupported IJuliaPyCommManager.register_target call."
+        @warn(
+            "Zounds! Unsupported IJuliaPyCommManager.register_target call.",
+            target, f,
+        )
     end
+end
+
+"""
+A shim around IPython's DisplayPublisher class.
+
+The DisplayPublisher (we actually inherit from ZMQDisplayPublisher which takes
+care of sending messages to the IOPub socket) is responsible for sending
+`IPython.display.display(...)` calls to the right place (e.g. stdout or a ZMQ
+socket).
+"""
+@pydef mutable struct IJuliaDisplayPublisher <: ipykernel.zmqshell.ZMQDisplayPublisher
+    # We can re-use all of the logic from ZMQDisplayPublisher since it's passed
+    # in the values of the IOPub socket and session from the kernel; we only
+    # need to help it along by specifying the current parent header. We have to
+    # do this because the IPython logic expects you to call set_parent on the
+    # InteractiveShell, but we don't do that.
+    parent_header.get(self) = IJulia.execute_msg.header
+end
+
+"""
+A shim around IPython's InteractiveShell class.
+
+Many parts of the IPython codebase use this class (which is a global singleton)
+to publish messages (see the `display_pub` attribute and the
+`IJuliaDisplayPublisher` class).
+"""
+@pydef mutable struct IJuliaInteractiveShell <: ipykernel.zmqshell.ZMQInteractiveShell
+    # Tell the existing initialization logic to use our custom display publisher
+    # class.
+    display_pub_class = IJuliaDisplayPublisher
+    parent_header.get(self) = IJulia.execute_msg.header
 end
 
 """
@@ -114,18 +166,19 @@ Many parts of the IPython codebase attempt to access the kernel instance (it's
 a global singleton) so we need to shim it in order to redirect things to the
 correct places in IJulia (e.g. we redirect the IOPub socket to IJulia's).
 """
-@pydef mutable struct IJuliaPyKernel <: pykernelbase.Kernel
+@pydef mutable struct IJuliaPyKernel <: ipykernel.ipkernel.IPythonKernel
     function __init__(self)
-        self.session = IJuliaPySession()
-        self.comm_manager = IJuliaPyCommManager(self)
+        ipykernel.ipkernel.IPythonKernel.__init__(
+            self,
+            session=IJuliaPySession(),
+            iopub_socket=IJulia.publish[],
+            shell_class=IJuliaInteractiveShell,
+        )
 
-        # Some things expect shell to be defined.
-        # TODO: we actually need to shim shell to get IPython's display(...)
-        # method to work correctly.
-        self.shell = nothing
+        # Overwrite comm_manager with our own.
+        self.comm_manager = IJuliaPyCommManager(kernel=self)
     end
 
-    iopub_socket.get(self) = IJulia.publish[]
     _parent_header.get(self) = IJulia.execute_msg.header
 end
 
